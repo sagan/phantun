@@ -1,13 +1,14 @@
 use clap::{crate_version, Arg, ArgAction, Command};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
-use log::{debug, error, info};
+use log::{debug, error, info, trace, warn};
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
 use tokio_tun::TunBuilder;
@@ -101,6 +102,50 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("active_timeout")
+                .long("active-timeout")
+                .required(false)
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..600))
+                .help("Sets the timeout in seconds to detect broken connection when outgoing traffic is present but no response is received from server. Defaults to 20 seconds.")
+                .default_value("20")
+        )
+        .arg(
+            Arg::new("keepalive_time")
+                .long("keepalive-time")
+                .short('k')
+                .required(false)
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..86400))
+                .help("Specify the interval in seconds of inactivity before sending TCP keepalive probes. \
+                       If not specified, no keepalive probe will be sent.")
+        )
+        .arg(
+            Arg::new("keepalive_interval")
+                .long("keepalive-interval")
+                .required(false)
+                .default_value("5")
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64).range(1..3600))
+                .help("Specify the interval in seconds between keepalive probes.")
+        )
+        .arg(
+            Arg::new("keepalive_retries")
+                .long("keepalive-retries")
+                .required(false)
+                .default_value("3")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u32).range(1..20))
+                .help("Specify the number of keepalive probe retries before closing connection.")
+        )
+        .arg(
+            Arg::new("filter_handshake")
+                .long("filter-handshake")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                .help("Filter out handshake packets (e.g. SSH banners) received from server from being forwarded to WireGuard UDP socket.")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -148,6 +193,13 @@ async fn main() -> io::Result<()> {
         .map(fs::read)
         .transpose()?;
 
+    let active_timeout = Duration::from_secs(*matches.get_one::<u64>("active_timeout").unwrap());
+    let tcp_keepalive_time = matches.get_one::<u64>("keepalive_time").map(|s| Duration::from_secs(*s));
+    let tcp_keepalive_intvl = Duration::from_secs(*matches.get_one::<u64>("keepalive_interval").unwrap());
+    let tcp_keepalive_retries = *matches.get_one::<u32>("keepalive_retries").unwrap();
+    let filter_handshake = matches.get_flag("filter_handshake") || handshake_packet.is_some();
+    let handshake_packet_bytes = handshake_packet.clone();
+
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
 
@@ -181,7 +233,10 @@ async fn main() -> io::Result<()> {
             // 2. It is some extra packets not filtered by more specific
             //    connected UDP socket yet
             if let Some(sock) = connections.read().await.get(&udp_remote_addr) {
-                sock.send(&buf_r[..size]).await;
+                if sock.send(&buf_r[..size]).await.is_none() {
+                    warn!("Connection to {} failed to send, closing", sock);
+                    connections.write().await.remove(&udp_remote_addr);
+                }
                 continue;
             }
 
@@ -217,13 +272,18 @@ async fn main() -> io::Result<()> {
             // spawn "fastpath" UDP socket and task, this will offload main task
             // from forwarding UDP packets
 
-            let packet_received = Arc::new(Notify::new());
+            let data_received = Arc::new(Notify::new());
+            let tcp_packet_received = Arc::new(Notify::new());
+            let udp_packet_received = Arc::new(Notify::new());
             let quit = CancellationToken::new();
 
             for i in 0..num_cpus {
                 let sock = sock.clone();
                 let quit = quit.clone();
-                let packet_received = packet_received.clone();
+                let data_received = data_received.clone();
+                let tcp_packet_received = tcp_packet_received.clone();
+                let udp_packet_received = udp_packet_received.clone();
+                let handshake_packet_bytes = handshake_packet_bytes.clone();
 
                 tokio::spawn(async move {
                     let mut buf_udp = [0u8; MAX_PACKET_LEN];
@@ -266,17 +326,29 @@ async fn main() -> io::Result<()> {
                                     return;
                                 }
 
-                                packet_received.notify_one();
+                                udp_packet_received.notify_one();
+                                data_received.notify_one();
                             },
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
-                                                error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
+                                        tcp_packet_received.notify_one();
+                                        data_received.notify_one();
+
+                                        if size > 0 {
+                                            let is_handshake_banner = filter_handshake && (
+                                                buf_tcp[..size].starts_with(b"SSH-")
+                                                || handshake_packet_bytes.as_deref().map_or(false, |p| buf_tcp[..size] == *p)
+                                            );
+
+                                            if is_handshake_banner {
+                                                debug!("Received handshake/SSH banner ({} bytes) from server, omitting forwarding to WireGuard UDP", size);
+                                            } else if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                                error!("Unable to send UDP packet to {}: {}, closing connection", udp_remote_addr, e);
                                                 quit.cancel();
                                                 return;
                                             }
+                                        }
                                     },
                                     None => {
                                         debug!("removed fake TCP socket from connections table");
@@ -284,8 +356,6 @@ async fn main() -> io::Result<()> {
                                         return;
                                     },
                                 }
-
-                                packet_received.notify_one();
                             },
                             _ = quit.cancelled() => {
                                 debug!("worker {} terminated", i);
@@ -297,28 +367,89 @@ async fn main() -> io::Result<()> {
             }
 
             let connections = connections.clone();
+            let sock_str = sock.to_string();
+            let sock_keepalive = sock.clone();
             tokio::spawn(async move {
+                let mut last_tcp_recv = Instant::now();
+                let mut last_udp_recv = Instant::now();
+                let mut last_data_recv = Instant::now();
+                let mut last_keepalive_sent = Instant::now();
+                let mut keepalive_probes_sent: u32 = 0;
+
                 loop {
-                    let read_timeout = time::sleep(UDP_TTL);
-                    let packet_received_fut = packet_received.notified();
+                    let tick = time::sleep(Duration::from_secs(1));
+                    let data_received_fut = data_received.notified();
+                    let tcp_packet_received_fut = tcp_packet_received.notified();
+                    let udp_packet_received_fut = udp_packet_received.notified();
 
                     tokio::select! {
-                        _ = read_timeout => {
-                            info!("No traffic seen in the last {:?}, closing connection", UDP_TTL);
-                            connections.write().await.remove(&udp_remote_addr);
-                            debug!("removed fake TCP socket from connections table");
+                        _ = tick => {
+                            let now = Instant::now();
 
-                            quit.cancel();
-                            return;
+                            // 1. Check Active Inactivity Timeout:
+                            // If we have sent UDP packets to the server, but received ZERO TCP response
+                            // for active_timeout duration, the connection is broken (e.g. NAT expired,
+                            // server dropped, DPI blocked). Close it to trigger auto-reconnect.
+                            if last_udp_recv > last_tcp_recv && now.duration_since(last_tcp_recv) >= active_timeout {
+                                warn!(
+                                    "Connection {} appears broken: outbound traffic active ({:?} ago), but no response from server for {:?}. Closing to reconnect.",
+                                    sock_str,
+                                    now.duration_since(last_udp_recv),
+                                    now.duration_since(last_tcp_recv)
+                                );
+                                break;
+                            }
+
+                            // 2. TCP Keepalive handling (if enabled)
+                            if let Some(ka_time) = tcp_keepalive_time {
+                                if now.duration_since(last_tcp_recv) >= ka_time {
+                                    if now.duration_since(last_keepalive_sent) >= tcp_keepalive_intvl {
+                                        if keepalive_probes_sent >= tcp_keepalive_retries {
+                                            warn!(
+                                                "Connection {} TCP keep-alive failed after {} retries without response, closing to reconnect",
+                                                sock_str, keepalive_probes_sent
+                                            );
+                                            break;
+                                        }
+
+                                        trace!(
+                                            "Connection {} sending keep-alive probe {}/{}",
+                                            sock_str, keepalive_probes_sent + 1, tcp_keepalive_retries
+                                        );
+                                        if sock_keepalive.send_keepalive().await.is_none() {
+                                            warn!("Connection {} failed to send keepalive probe", sock_str);
+                                        }
+                                        keepalive_probes_sent += 1;
+                                        last_keepalive_sent = Instant::now();
+                                    }
+                                }
+                            }
+
+                            // 3. Overall Inactivity Timeout (UDP_TTL)
+                            if now.duration_since(last_data_recv) >= UDP_TTL {
+                                info!("No traffic seen in the last {:?}, closing connection {}", UDP_TTL, sock_str);
+                                break;
+                            }
                         },
                         _ = quit.cancelled() => {
-                            connections.write().await.remove(&udp_remote_addr);
-                            debug!("removed fake TCP socket from connections table");
-                            return;
+                            break;
                         },
-                        _ = packet_received_fut => {},
+                        _ = udp_packet_received_fut => {
+                            last_udp_recv = Instant::now();
+                        },
+                        _ = tcp_packet_received_fut => {
+                            last_tcp_recv = Instant::now();
+                            keepalive_probes_sent = 0;
+                        },
+                        _ = data_received_fut => {
+                            last_data_recv = Instant::now();
+                        },
                     }
                 }
+
+                connections.write().await.remove(&udp_remote_addr);
+                debug!("removed fake TCP socket {} from connections table", sock_str);
+                quit.cancel();
             });
         }
     });

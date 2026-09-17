@@ -101,6 +101,13 @@ async fn main() -> io::Result<()> {
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
+        .arg(
+            Arg::new("filter_handshake")
+                .long("filter-handshake")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                .help("Filter out handshake packets (e.g. SSH banners) received from client from being forwarded to WireGuard UDP socket.")
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -146,6 +153,8 @@ async fn main() -> io::Result<()> {
         .get_one::<String>("handshake_packet")
         .map(fs::read)
         .transpose()?;
+    let filter_handshake = matches.get_flag("filter_handshake") || handshake_packet.is_some();
+    let handshake_packet_bytes = handshake_packet.clone();
 
     let num_cpus = num_cpus::get();
     info!("{} cores available", num_cpus);
@@ -202,6 +211,7 @@ async fn main() -> io::Result<()> {
                 let quit = quit.clone();
                 let packet_received = packet_received.clone();
                 let udp_sock = new_udp_reuseport(local_addr);
+                let handshake_packet_bytes = handshake_packet_bytes.clone();
 
                 tokio::spawn(async move {
                     udp_sock.connect(remote_addr).await.unwrap();
@@ -219,12 +229,20 @@ async fn main() -> io::Result<()> {
                             res = sock.recv(&mut buf_tcp) => {
                                 match res {
                                     Some(size) => {
-                                        if size > 0
-                                            && let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
+                                        if size > 0 {
+                                            let is_handshake_banner = filter_handshake && (
+                                                buf_tcp[..size].starts_with(b"SSH-")
+                                                || handshake_packet_bytes.as_deref().map_or(false, |p| buf_tcp[..size] == *p)
+                                            );
+
+                                            if is_handshake_banner {
+                                                debug!("Received handshake/SSH banner ({} bytes) from client, omitting forwarding to WireGuard UDP", size);
+                                            } else if let Err(e) = udp_sock.send(&buf_tcp[..size]).await {
                                                 error!("Unable to send UDP packet to {}: {}, closing connection", e, remote_addr);
                                                 quit.cancel();
                                                 return;
                                             }
+                                        }
                                     },
                                     None => {
                                         quit.cancel();
