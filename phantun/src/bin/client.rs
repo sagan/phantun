@@ -1,4 +1,4 @@
-use clap::{crate_version, Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, trace, warn};
@@ -107,9 +107,9 @@ async fn main() -> io::Result<()> {
                 .long("active-timeout")
                 .required(false)
                 .value_name("SECONDS")
-                .value_parser(clap::value_parser!(u64).range(1..600))
-                .help("Sets the timeout in seconds to detect broken connection when outgoing traffic is present but no response is received from server. Defaults to 20 seconds.")
-                .default_value("20")
+                .value_parser(clap::value_parser!(u64).range(0..600))
+                .help("Sets the timeout in seconds to detect broken connection when outgoing traffic is present but no response is received from server. Defaults to 0 (disabled).")
+                .default_value("0")
         )
         .arg(
             Arg::new("keepalive_time")
@@ -194,8 +194,11 @@ async fn main() -> io::Result<()> {
         .transpose()?;
 
     let active_timeout = Duration::from_secs(*matches.get_one::<u64>("active_timeout").unwrap());
-    let tcp_keepalive_time = matches.get_one::<u64>("keepalive_time").map(|s| Duration::from_secs(*s));
-    let tcp_keepalive_intvl = Duration::from_secs(*matches.get_one::<u64>("keepalive_interval").unwrap());
+    let tcp_keepalive_time = matches
+        .get_one::<u64>("keepalive_time")
+        .map(|s| Duration::from_secs(*s));
+    let tcp_keepalive_intvl =
+        Duration::from_secs(*matches.get_one::<u64>("keepalive_interval").unwrap());
     let tcp_keepalive_retries = *matches.get_one::<u32>("keepalive_retries").unwrap();
     let filter_handshake = matches.get_flag("filter_handshake") || handshake_packet.is_some();
     let handshake_packet_bytes = handshake_packet.clone();
@@ -227,7 +230,8 @@ async fn main() -> io::Result<()> {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
-            let (size, udp_remote_addr, udp_local_addr) = udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
+            let (size, udp_remote_addr, udp_local_addr) =
+                udp_recv_pktinfo(&udp_sock, &mut buf_r).await?;
             // seen UDP packet to listening socket, this means:
             // 1. It is a new UDP connection, or
             // 2. It is some extra packets not filtered by more specific
@@ -262,11 +266,13 @@ async fn main() -> io::Result<()> {
                 continue;
             }
 
-            assert!(connections
-                .write()
-                .await
-                .insert(udp_remote_addr, sock.clone())
-                .is_none());
+            assert!(
+                connections
+                    .write()
+                    .await
+                    .insert(udp_remote_addr, sock.clone())
+                    .is_none()
+            );
             debug!("inserted fake TCP socket into connection table");
 
             // spawn "fastpath" UDP socket and task, this will offload main task
@@ -297,10 +303,7 @@ async fn main() -> io::Result<()> {
                     // connect to (<incoming packet src_ip>, <incoming packet src_port>).
                     let bind_addr = match (udp_remote_addr, udp_local_addr) {
                         (SocketAddr::V4(_), IpAddr::V4(udp_local_ipv4)) => {
-                            SocketAddr::V4(SocketAddrV4::new(
-                                udp_local_ipv4,
-                                local_addr.port(),
-                            ))
+                            SocketAddr::V4(SocketAddrV4::new(udp_local_ipv4, local_addr.port()))
                         }
                         (SocketAddr::V6(udp_remote_addr), IpAddr::V6(udp_local_ipv6)) => {
                             SocketAddr::V6(SocketAddrV6::new(
@@ -311,7 +314,9 @@ async fn main() -> io::Result<()> {
                             ))
                         }
                         (_, _) => {
-                            panic!("unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}");
+                            panic!(
+                                "unexpected family combination for udp_remote_addr={udp_remote_addr} and udp_local_addr={udp_local_addr}"
+                            );
                         }
                     };
                     let udp_sock = new_udp_reuseport(bind_addr);
@@ -390,7 +395,7 @@ async fn main() -> io::Result<()> {
                             // If we have sent UDP packets to the server, but received ZERO TCP response
                             // for active_timeout duration, the connection is broken (e.g. NAT expired,
                             // server dropped, DPI blocked). Close it to trigger auto-reconnect.
-                            if last_udp_recv > last_tcp_recv && now.duration_since(last_tcp_recv) >= active_timeout {
+                            if active_timeout > Duration::ZERO && last_udp_recv > last_tcp_recv && now.duration_since(last_tcp_recv) >= active_timeout {
                                 warn!(
                                     "Connection {} appears broken: outbound traffic active ({:?} ago), but no response from server for {:?}. Closing to reconnect.",
                                     sock_str,
@@ -448,7 +453,10 @@ async fn main() -> io::Result<()> {
                 }
 
                 connections.write().await.remove(&udp_remote_addr);
-                debug!("removed fake TCP socket {} from connections table", sock_str);
+                debug!(
+                    "removed fake TCP socket {} from connections table",
+                    sock_str
+                );
                 quit.cancel();
             });
         }
