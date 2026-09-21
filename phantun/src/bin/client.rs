@@ -2,6 +2,7 @@ use clap::{Arg, ArgAction, Command, crate_version};
 use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, trace, warn};
+use phantun::nftables::NftRuleGuard;
 use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
 use std::collections::HashMap;
 use std::fs;
@@ -146,6 +147,23 @@ async fn main() -> io::Result<()> {
                 .action(ArgAction::SetTrue)
                 .help("Filter out handshake packets (e.g. SSH banners) received from server from being forwarded to WireGuard UDP socket.")
         )
+        .arg(
+            Arg::new("no_nftables")
+                .long("no-nftables")
+                .alias("no-nft")
+                .alias("disable-nftables")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                .help("Do not automatically add/remove nftables rules")
+        )
+        .arg(
+            Arg::new("nft_interface")
+                .long("nft-interface")
+                .alias("interface")
+                .required(false)
+                .value_name("IFACE")
+                .help("Sets the physical network interface used in nftables rules (default: auto-detected)")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -221,12 +239,25 @@ async fn main() -> io::Result<()> {
 
     info!("Created TUN device {}", tun[0].name());
 
+    let nft_interface = matches.get_one::<String>("nft_interface").map(|s| s.as_str());
+    let nft_guard = if !matches.get_flag("no_nftables") {
+        match NftRuleGuard::setup_client(tun[0].name(), nft_interface) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                error!("Failed to setup nftables rules: {}", e);
+                return Err(e);
+            }
+        }
+    } else {
+        None
+    };
+
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
-    let main_loop = tokio::spawn(async move {
+    let mut main_loop: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
 
         loop {
@@ -462,5 +493,25 @@ async fn main() -> io::Result<()> {
         }
     });
 
-    tokio::join!(main_loop).0.unwrap()
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        res = &mut main_loop => {
+            if let Ok(Err(e)) = res {
+                error!("Main loop error: {}", e);
+            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            info!("Received SIGINT, shutting down...");
+        },
+        _ = sigterm.recv() => {
+            info!("Received SIGTERM, shutting down...");
+        }
+    }
+
+    if let Some(mut guard) = nft_guard {
+        guard.remove_rules();
+    }
+
+    Ok(())
 }

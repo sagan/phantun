@@ -121,6 +121,7 @@ Edit `/etc/sysctl.conf`, add `net.ipv4.ip_forward=1` and run `sudo sysctl -p /et
 
 ## 2. Add required firewall rules
 
+> **Note:** **Automatic nftables management**: By default, `phantun_client` and `phantun_server` automatically add the required nftables rules to `table inet phantun` on startup and remove them on exit (in a best-effort manner). You can disable this feature using the `--no-nftables` cmdline flag if you prefer configuring firewall rules manually.
 
 ### Client
 
