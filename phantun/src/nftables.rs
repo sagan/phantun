@@ -1,4 +1,4 @@
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::process::Command;
@@ -262,13 +262,7 @@ impl NftRuleGuard {
         }
         self.removed = true;
 
-        let mut chains_to_check = Vec::new();
-
         for rule in &self.rules {
-            if !chains_to_check.contains(&rule.chain) {
-                chains_to_check.push(rule.chain.clone());
-            }
-
             let handle_str = rule.handle.to_string();
             let res = execute_nft(&[
                 "delete",
@@ -292,38 +286,6 @@ impl NftRuleGuard {
                         "Failed to remove nftables rule handle {} in {}: {}",
                         rule.handle, rule.chain, e
                     );
-                }
-            }
-        }
-
-        // Clean up empty chains (best-effort)
-        for chain in chains_to_check {
-            let res = execute_nft(&["delete", "chain", TABLE_FAMILY, TABLE_NAME, &chain]);
-            match res {
-                Ok(_) => {
-                    debug!("Deleted empty chain {} in table {} {}", chain, TABLE_FAMILY, TABLE_NAME);
-                }
-                Err(e) => {
-                    debug!(
-                        "Chain {} in table {} {} not deleted (may still contain rules): {}",
-                        chain, TABLE_FAMILY, TABLE_NAME, e
-                    );
-                }
-            }
-        }
-
-        // Clean up table if all chains are deleted (best-effort)
-        if let Ok(output) = execute_nft(&["list", "table", TABLE_FAMILY, TABLE_NAME]) {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.contains("chain ") {
-                let res = execute_nft(&["delete", "table", TABLE_FAMILY, TABLE_NAME]);
-                match res {
-                    Ok(_) => {
-                        info!("Deleted empty table {} {}", TABLE_FAMILY, TABLE_NAME);
-                    }
-                    Err(e) => {
-                        debug!("Table {} {} not deleted: {}", TABLE_FAMILY, TABLE_NAME, e);
-                    }
                 }
             }
         }
@@ -609,6 +571,53 @@ mod tests {
         server_guard.remove_rules();
         assert_eq!(
             get_chain_rule_handles("prerouting", &|r| r.contains(&port_str)).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_multiple_servers_coexistence() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let port1 = 59878;
+        let port2 = 59879;
+        let tun_peer = Ipv4Addr::new(192, 168, 201, 2);
+        let iface = detect_physical_interface();
+
+        let mut server1 = NftRuleGuard::setup_server(port1, tun_peer, None, iface.as_deref())
+            .expect("Failed to setup server 1");
+        let mut server2 = NftRuleGuard::setup_server(port2, tun_peer, None, iface.as_deref())
+            .expect("Failed to setup server 2");
+
+        let port1_str = port1.to_string();
+        let port2_str = port2.to_string();
+
+        assert_eq!(
+            get_chain_rule_handles("prerouting", &|r| r.contains(&port1_str)).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            get_chain_rule_handles("prerouting", &|r| r.contains(&port2_str)).unwrap().len(),
+            1
+        );
+
+        // Stopping server 1 MUST NOT remove server 2's rules or flush the table/chain
+        server1.remove_rules();
+
+        assert_eq!(
+            get_chain_rule_handles("prerouting", &|r| r.contains(&port1_str)).unwrap().len(),
+            0,
+            "Server 1 rule should be removed"
+        );
+        assert_eq!(
+            get_chain_rule_handles("prerouting", &|r| r.contains(&port2_str)).unwrap().len(),
+            1,
+            "Server 2 rule MUST remain in prerouting after server 1 stops"
+        );
+
+        // Now stop server 2
+        server2.remove_rules();
+        assert_eq!(
+            get_chain_rule_handles("prerouting", &|r| r.contains(&port2_str)).unwrap().len(),
             0
         );
     }
