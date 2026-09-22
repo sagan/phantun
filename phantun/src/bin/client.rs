@@ -9,6 +9,7 @@ use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, RwLock};
 use tokio::time;
@@ -16,6 +17,16 @@ use tokio_tun::TunBuilder;
 use tokio_util::sync::CancellationToken;
 
 use phantun::UDP_TTL;
+
+async fn resolve_remote(remote_str: &str, ipv4_only: bool) -> Option<SocketAddr> {
+    match tokio::net::lookup_host(remote_str).await {
+        Ok(mut addrs) => addrs.find(|addr| !ipv4_only || addr.is_ipv4()),
+        Err(e) => {
+            warn!("Failed to resolve remote host {}: {}", remote_str, e);
+            None
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -183,12 +194,21 @@ async fn main() -> io::Result<()> {
 
     let ipv4_only = matches.get_flag("ipv4_only");
 
-    let remote_addr = tokio::net::lookup_host(matches.get_one::<String>("remote").unwrap())
+    let remote_str = matches.get_one::<String>("remote").unwrap().to_string();
+    let remote_is_domain = remote_str.parse::<SocketAddr>().is_err();
+
+    let remote_addr = tokio::net::lookup_host(&remote_str)
         .await
         .expect("bad remote address or host")
         .find(|addr| !ipv4_only || addr.is_ipv4())
         .expect("unable to resolve remote host name");
     info!("Remote address is: {}", remote_addr);
+    if remote_is_domain {
+        info!(
+            "Remote endpoint is domain ({}); dynamic re-resolution enabled on failure/broken state",
+            remote_str
+        );
+    }
 
     let tun_local: Ipv4Addr = matches
         .get_one::<String>("tun_local")
@@ -242,16 +262,18 @@ async fn main() -> io::Result<()> {
         .build()
         .unwrap();
 
+    let tun_dev_name = tun[0].name().to_string();
+    let ipv6_assigned = Arc::new(AtomicBool::new(remote_addr.is_ipv6()));
     if remote_addr.is_ipv6() {
-        assign_ipv6_address(tun[0].name(), tun_local6.unwrap(), tun_peer6.unwrap());
+        assign_ipv6_address(&tun_dev_name, tun_local6.unwrap(), tun_peer6.unwrap());
     }
 
-    info!("Created TUN device {}", tun[0].name());
+    info!("Created TUN device {}", tun_dev_name);
 
     let nft_interface = matches.get_one::<String>("nft_interface").map(|s| s.as_str());
     let fwmark = matches.get_one::<u32>("fwmark").copied();
     let nft_guard = if !matches.get_flag("no_nftables") {
-        match NftRuleGuard::setup_client(tun[0].name(), nft_interface, fwmark) {
+        match NftRuleGuard::setup_client(&tun_dev_name, nft_interface, fwmark) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 error!("Failed to setup nftables rules: {}", e);
@@ -267,11 +289,28 @@ async fn main() -> io::Result<()> {
 
     let udp_sock = Arc::new(new_udp_reuseport(local_addr));
     let connections = Arc::new(RwLock::new(HashMap::<SocketAddr, Arc<Socket>>::new()));
+    let shared_remote_addr = Arc::new(RwLock::new(remote_addr));
+    let connection_broken = Arc::new(AtomicBool::new(false));
 
     let mut stack = Stack::new(tun, tun_peer, tun_peer6);
 
     let mut main_loop: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];
+        let mut consecutive_failures: u32 = 0;
+        let mut last_dns_lookup = Instant::now() - Duration::from_secs(10);
+
+        let ensure_ipv6 = {
+            let tun_dev_name = tun_dev_name.clone();
+            let ipv6_assigned = ipv6_assigned.clone();
+            move |addr: SocketAddr| {
+                if addr.is_ipv6() && !ipv6_assigned.load(Ordering::Relaxed) {
+                    if let (Some(l6), Some(p6)) = (tun_local6, tun_peer6) {
+                        assign_ipv6_address(&tun_dev_name, l6, p6);
+                        ipv6_assigned.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
 
         loop {
             let (size, udp_remote_addr, udp_local_addr) =
@@ -284,21 +323,81 @@ async fn main() -> io::Result<()> {
                 if sock.send(&buf_r[..size]).await.is_none() {
                     warn!("Connection to {} failed to send, closing", sock);
                     connections.write().await.remove(&udp_remote_addr);
+                    connection_broken.store(true, Ordering::Relaxed);
                 }
                 continue;
             }
 
             info!("New UDP client from {}", udp_remote_addr);
-            let sock = stack.connect(remote_addr).await;
+
+            // If remote was specified as a domain, and the connection is currently in a
+            // broken/down state (previous connection broke, or consecutive connection attempts failed),
+            // try to resolve the domain to the latest IP before attempting to connect.
+            if remote_is_domain
+                && (connection_broken.load(Ordering::Relaxed) || consecutive_failures > 0)
+                && last_dns_lookup.elapsed() >= Duration::from_secs(2)
+            {
+                last_dns_lookup = Instant::now();
+                if let Some(new_addr) = resolve_remote(&remote_str, ipv4_only).await {
+                    let mut cur = shared_remote_addr.write().await;
+                    if new_addr != *cur {
+                        info!(
+                            "Remote host {} resolved to new address: {} (was: {})",
+                            remote_str, new_addr, *cur
+                        );
+                        *cur = new_addr;
+                        ensure_ipv6(new_addr);
+                    }
+                }
+            }
+
+            let current_remote_addr = *shared_remote_addr.read().await;
+            ensure_ipv6(current_remote_addr);
+
+            let mut sock = stack.connect(current_remote_addr).await;
             if sock.is_none() {
-                error!("Unable to connect to remote {}", remote_addr);
-                continue;
+                consecutive_failures += 1;
+                error!(
+                    "Unable to connect to remote {} (failed attempts: {})",
+                    current_remote_addr, consecutive_failures
+                );
+
+                // If remote is domain, check if it resolves to a new IP and retry connecting
+                if remote_is_domain && last_dns_lookup.elapsed() >= Duration::from_secs(2) {
+                    last_dns_lookup = Instant::now();
+                    if let Some(new_addr) = resolve_remote(&remote_str, ipv4_only).await {
+                        let mut cur = shared_remote_addr.write().await;
+                        if new_addr != *cur {
+                            info!(
+                                "Remote host {} resolved to new address: {} (was: {})",
+                                remote_str, new_addr, *cur
+                            );
+                            *cur = new_addr;
+                            ensure_ipv6(new_addr);
+
+                            info!("Retrying connect to new remote address {}", new_addr);
+                            sock = stack.connect(new_addr).await;
+                            if sock.is_some() {
+                                consecutive_failures = 0;
+                                connection_broken.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+
+                if sock.is_none() {
+                    continue;
+                }
+            } else {
+                consecutive_failures = 0;
+                connection_broken.store(false, Ordering::Relaxed);
             }
 
             let sock = Arc::new(sock.unwrap());
             if let Some(ref p) = handshake_packet {
                 if sock.send(p).await.is_none() {
                     error!("Failed to send handshake packet to remote, closing connection.");
+                    connection_broken.store(true, Ordering::Relaxed);
                     continue;
                 }
 
@@ -307,6 +406,7 @@ async fn main() -> io::Result<()> {
 
             // send first packet
             if sock.send(&buf_r[..size]).await.is_none() {
+                connection_broken.store(true, Ordering::Relaxed);
                 continue;
             }
 
@@ -418,12 +518,16 @@ async fn main() -> io::Result<()> {
             let connections = connections.clone();
             let sock_str = sock.to_string();
             let sock_keepalive = sock.clone();
+            let connection_broken = connection_broken.clone();
+            let shared_remote_addr = shared_remote_addr.clone();
+            let remote_str_task = remote_str.clone();
             tokio::spawn(async move {
                 let mut last_tcp_recv = Instant::now();
                 let mut last_udp_recv = Instant::now();
                 let mut last_data_recv = Instant::now();
                 let mut last_keepalive_sent = Instant::now();
                 let mut keepalive_probes_sent: u32 = 0;
+                let mut last_dns_check = Instant::now();
 
                 loop {
                     let tick = time::sleep(Duration::from_secs(1));
@@ -446,6 +550,7 @@ async fn main() -> io::Result<()> {
                                     now.duration_since(last_udp_recv),
                                     now.duration_since(last_tcp_recv)
                                 );
+                                connection_broken.store(true, Ordering::Relaxed);
                                 break;
                             }
 
@@ -458,6 +563,7 @@ async fn main() -> io::Result<()> {
                                                 "Connection {} TCP keep-alive failed after {} retries without response, closing to reconnect",
                                                 sock_str, keepalive_probes_sent
                                             );
+                                            connection_broken.store(true, Ordering::Relaxed);
                                             break;
                                         }
 
@@ -474,13 +580,35 @@ async fn main() -> io::Result<()> {
                                 }
                             }
 
-                            // 3. Overall Inactivity Timeout (UDP_TTL)
+                            // 3. If remote is a domain and outbound traffic is active without TCP response,
+                            // periodically check if the domain resolved to a new IP
+                            if remote_is_domain && last_udp_recv > last_tcp_recv {
+                                let unack_duration = now.duration_since(last_tcp_recv);
+                                if unack_duration >= Duration::from_secs(10) && now.duration_since(last_dns_check) >= Duration::from_secs(5) {
+                                    last_dns_check = now;
+                                    if let Some(new_addr) = resolve_remote(&remote_str_task, ipv4_only).await {
+                                        let cur = *shared_remote_addr.read().await;
+                                        if new_addr != cur {
+                                            warn!(
+                                                "Connection {} appears broken: remote host {} changed address to {} (current: {}). Closing to reconnect.",
+                                                sock_str, remote_str_task, new_addr, cur
+                                            );
+                                            *shared_remote_addr.write().await = new_addr;
+                                            connection_broken.store(true, Ordering::Relaxed);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 4. Overall Inactivity Timeout (UDP_TTL)
                             if now.duration_since(last_data_recv) >= UDP_TTL {
                                 info!("No traffic seen in the last {:?}, closing connection {}", UDP_TTL, sock_str);
                                 break;
                             }
                         },
                         _ = quit.cancelled() => {
+                            connection_broken.store(true, Ordering::Relaxed);
                             break;
                         },
                         _ = udp_packet_received_fut => {
@@ -528,3 +656,35 @@ async fn main() -> io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remote_is_domain_detection() {
+        let ip_v4 = "192.168.1.1:4567";
+        assert!(!ip_v4.parse::<SocketAddr>().is_err());
+
+        let ip_v6 = "[2001:db8::1]:4567";
+        assert!(!ip_v6.parse::<SocketAddr>().is_err());
+
+        let domain = "example.com:4567";
+        assert!(domain.parse::<SocketAddr>().is_err());
+
+        let localhost = "localhost:4567";
+        assert!(localhost.parse::<SocketAddr>().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_remote_domain() {
+        let resolved = resolve_remote("127.0.0.1:4567", true).await;
+        assert_eq!(resolved, Some("127.0.0.1:4567".parse().unwrap()));
+
+        let resolved_local = resolve_remote("localhost:4567", true).await;
+        assert!(resolved_local.is_some());
+        assert!(resolved_local.unwrap().is_ipv4());
+        assert_eq!(resolved_local.unwrap().port(), 4567);
+    }
+}
+
