@@ -164,6 +164,15 @@ async fn main() -> io::Result<()> {
                 .value_name("IFACE")
                 .help("Sets the physical network interface used in nftables rules (default: auto-detected)")
         )
+        .arg(
+            Arg::new("fwmark")
+                .long("fwmark")
+                .alias("mark")
+                .required(false)
+                .value_name("MARK")
+                .value_parser(phantun::nftables::parse_fwmark)
+                .help("Sets the netfilter fwmark for fake TCP packets originating from the Tun interface (accepts decimal or 0x-prefixed hex)")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -240,8 +249,9 @@ async fn main() -> io::Result<()> {
     info!("Created TUN device {}", tun[0].name());
 
     let nft_interface = matches.get_one::<String>("nft_interface").map(|s| s.as_str());
+    let fwmark = matches.get_one::<u32>("fwmark").copied();
     let nft_guard = if !matches.get_flag("no_nftables") {
-        match NftRuleGuard::setup_client(tun[0].name(), nft_interface) {
+        match NftRuleGuard::setup_client(tun[0].name(), nft_interface, fwmark) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 error!("Failed to setup nftables rules: {}", e);
@@ -249,6 +259,9 @@ async fn main() -> io::Result<()> {
             }
         }
     } else {
+        if fwmark.is_some() {
+            info!("Note: --no-nftables is specified, fwmark rule must be configured manually.");
+        }
         None
     };
 

@@ -32,7 +32,13 @@ impl NftRuleGuard {
     /// Rule: `iifname "<tun_name>" oif "<iface>" masquerade`
     /// If `physical_iface` is None, auto-detection is attempted. If still None,
     /// `iifname "<tun_name>" masquerade` is added.
-    pub fn setup_client(tun_name: &str, physical_iface: Option<&str>) -> io::Result<Self> {
+    /// If `fwmark` is Some, a rule is also added to `prerouting_mangle`:
+    /// `iifname "<tun_name>" meta mark set <fwmark>`
+    pub fn setup_client(
+        tun_name: &str,
+        physical_iface: Option<&str>,
+        fwmark: Option<u32>,
+    ) -> io::Result<Self> {
         let detected_iface = physical_iface.map(String::from).or_else(detect_physical_interface);
         let iface_opt = detected_iface.as_deref();
 
@@ -103,18 +109,93 @@ impl NftRuleGuard {
             }
         }
 
+        if let Some(mark) = fwmark {
+            guard.add_fwmark_rule(tun_name, mark)?;
+        }
+
         Ok(guard)
+    }
+
+    /// Adds an nftables rule to set the fwmark for packets originating from `tun_name`:
+    /// Chain: `prerouting_mangle`
+    /// Hook: `prerouting` priority `mangle` (-150)
+    /// Rule: `iifname "<tun_name>" meta mark set <fwmark>`
+    pub fn add_fwmark_rule(&mut self, tun_name: &str, fwmark: u32) -> io::Result<()> {
+        ensure_table_exists()?;
+        ensure_chain_exists(
+            "prerouting_mangle",
+            "{ type filter hook prerouting priority mangle; policy accept; }",
+        )?;
+
+        let rule_str = format!("iifname \"{}\" meta mark set {:#x}", tun_name, fwmark);
+        let tun_quoted = format!("\"{}\"", tun_name);
+        let mark_hex_8 = format!("0x{:08x}", fwmark);
+        let mark_hex = format!("{:#x}", fwmark);
+        let mark_dec = fwmark.to_string();
+
+        let predicate = move |rule: &str| {
+            let matches_tun = rule.contains("iifname") && (rule.contains(&tun_quoted) || rule.contains(tun_name));
+            let matches_action = rule.contains("meta mark set") || rule.contains("mark set");
+            let rule_lower = rule.to_ascii_lowercase();
+            let matches_mark = rule_lower.contains(&mark_hex_8)
+                || rule_lower.contains(&mark_hex)
+                || rule.contains(&mark_dec);
+            matches_tun && matches_action && matches_mark
+        };
+
+        let existing_handles = get_chain_rule_handles("prerouting_mangle", &predicate)?;
+        if !existing_handles.is_empty() {
+            info!(
+                "nftables fwmark rule for TUN {} mark {:#x} already exists in table {} {}, reusing handle(s) {:?}",
+                tun_name, fwmark, TABLE_FAMILY, TABLE_NAME, existing_handles
+            );
+            for h in existing_handles {
+                self.rules.push(NftRule {
+                    chain: "prerouting_mangle".to_string(),
+                    handle: h,
+                    description: rule_str.clone(),
+                });
+            }
+        } else {
+            execute_nft(&[
+                "add",
+                "rule",
+                TABLE_FAMILY,
+                TABLE_NAME,
+                "prerouting_mangle",
+                &rule_str,
+            ])?;
+            info!(
+                "Added nftables rule to {} {}: {}",
+                TABLE_FAMILY, TABLE_NAME, rule_str
+            );
+
+            let handles = get_chain_rule_handles("prerouting_mangle", &predicate)?;
+            for h in handles {
+                self.rules.push(NftRule {
+                    chain: "prerouting_mangle".to_string(),
+                    handle: h,
+                    description: rule_str.clone(),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Sets up server nftables rules in table `inet phantun`:
     /// Chain: `prerouting`
     /// IPv4 Rule: `iif "<iface>" tcp dport <local_port> dnat ip to <tun_peer>`
     /// IPv6 Rule: `iif "<iface>" tcp dport <local_port> dnat ip6 to <tun_peer6>` (if IPv6 enabled)
+    /// If `fwmark` is Some, a rule is also added to `prerouting_mangle`:
+    /// `iifname "<tun_name>" meta mark set <fwmark>`
     pub fn setup_server(
         local_port: u16,
+        tun_name: &str,
         tun_peer: Ipv4Addr,
         tun_peer6: Option<Ipv6Addr>,
         physical_iface: Option<&str>,
+        fwmark: Option<u32>,
     ) -> io::Result<Self> {
         let detected_iface = physical_iface.map(String::from).or_else(detect_physical_interface);
         let iface_opt = detected_iface.as_deref();
@@ -251,6 +332,10 @@ impl NftRuleGuard {
             }
         }
 
+        if let Some(mark) = fwmark {
+            guard.add_fwmark_rule(tun_name, mark)?;
+        }
+
         Ok(guard)
     }
 
@@ -337,6 +422,22 @@ pub fn ensure_table_exists() -> io::Result<()> {
 pub fn ensure_chain_exists(chain_name: &str, chain_def: &str) -> io::Result<()> {
     execute_nft(&["add", "chain", TABLE_FAMILY, TABLE_NAME, chain_name, chain_def])?;
     Ok(())
+}
+
+/// Parses a netfilter fwmark string in either decimal or hex (with `0x` or `0X` prefix).
+pub fn parse_fwmark(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    let res = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+    } else {
+        s.parse::<u32>()
+    };
+    res.map_err(|e| {
+        format!(
+            "invalid fwmark \"{}\": must be a valid 32-bit unsigned integer (decimal or 0x-prefixed hex): {}",
+            s, e
+        )
+    })
 }
 
 /// Returns rule handles for all rules in `chain` matching `predicate`.
@@ -466,13 +567,27 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_fwmark() {
+        assert_eq!(parse_fwmark("256").unwrap(), 256);
+        assert_eq!(parse_fwmark("0x100").unwrap(), 256);
+        assert_eq!(parse_fwmark("0X100").unwrap(), 256);
+        assert_eq!(parse_fwmark("0x10").unwrap(), 16);
+        assert_eq!(parse_fwmark("0xa").unwrap(), 10);
+        assert_eq!(parse_fwmark("0").unwrap(), 0);
+        assert_eq!(parse_fwmark("0xffffffff").unwrap(), 0xffffffff);
+        assert!(parse_fwmark("invalid").is_err());
+        assert!(parse_fwmark("-1").is_err());
+        assert!(parse_fwmark("0x100000000").is_err());
+    }
+
+    #[test]
     fn test_client_nftables_lifecycle() {
         let _lock = TEST_LOCK.lock().unwrap();
         let test_tun = "tun_test_c";
         let iface = detect_physical_interface();
 
         // 1. Setup client
-        let mut guard = NftRuleGuard::setup_client(test_tun, iface.as_deref())
+        let mut guard = NftRuleGuard::setup_client(test_tun, iface.as_deref(), None)
             .expect("Failed to setup client nftables");
         assert!(!guard.rules.is_empty(), "Expected rules to be registered");
 
@@ -482,7 +597,7 @@ mod tests {
         assert_eq!(handles.len(), 1);
 
         // 2. Setup client again with same parameters (test idempotency)
-        let mut guard2 = NftRuleGuard::setup_client(test_tun, iface.as_deref())
+        let mut guard2 = NftRuleGuard::setup_client(test_tun, iface.as_deref(), None)
             .expect("Failed to setup client nftables second time");
         let handles2 = get_chain_rule_handles("postrouting", &|r| r.contains(test_tun))
             .expect("Failed to query handles");
@@ -501,12 +616,13 @@ mod tests {
     fn test_server_nftables_lifecycle() {
         let _lock = TEST_LOCK.lock().unwrap();
         let test_port = 59876;
+        let test_tun = "tun_test_s";
         let tun_peer = Ipv4Addr::new(192, 168, 201, 2);
         let tun_peer6 = Some(Ipv6Addr::new(0xfcc9, 0, 0, 0, 0, 0, 0, 2));
         let iface = detect_physical_interface();
 
         // 1. Setup server
-        let mut guard = NftRuleGuard::setup_server(test_port, tun_peer, tun_peer6, iface.as_deref())
+        let mut guard = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, iface.as_deref(), None)
             .expect("Failed to setup server nftables");
         assert_eq!(guard.rules.len(), 2, "Expected IPv4 and IPv6 rules");
 
@@ -517,7 +633,7 @@ mod tests {
         assert_eq!(handles.len(), 2);
 
         // 2. Setup server again (idempotency)
-        let mut guard2 = NftRuleGuard::setup_server(test_port, tun_peer, tun_peer6, iface.as_deref())
+        let mut guard2 = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, iface.as_deref(), None)
             .expect("Failed to setup server nftables second time");
         let handles2 = get_chain_rule_handles("prerouting", &|r| r.contains(&port_str))
             .expect("Failed to query handles");
@@ -533,6 +649,38 @@ mod tests {
     }
 
     #[test]
+    fn test_fwmark_lifecycle() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let test_tun = "tun_test_fwm";
+        let test_mark = 0x100;
+        let iface = detect_physical_interface();
+
+        // Setup client with fwmark
+        let mut guard = NftRuleGuard::setup_client(test_tun, iface.as_deref(), Some(test_mark))
+            .expect("Failed to setup client with fwmark");
+        assert_eq!(guard.rules.len(), 2, "Expected masquerade and fwmark rules");
+
+        // Verify fwmark rule in prerouting_mangle
+        let handles = get_chain_rule_handles("prerouting_mangle", &|r| r.contains(test_tun) && r.contains("0x00000100"))
+            .expect("Failed to query handles");
+        assert_eq!(handles.len(), 1);
+
+        // Setup second time (idempotency)
+        let mut guard2 = NftRuleGuard::setup_client(test_tun, iface.as_deref(), Some(test_mark))
+            .expect("Failed to setup client second time with fwmark");
+        let handles2 = get_chain_rule_handles("prerouting_mangle", &|r| r.contains(test_tun) && r.contains("0x00000100"))
+            .expect("Failed to query handles");
+        assert_eq!(handles2.len(), 1);
+
+        guard2.removed = true;
+        guard.remove_rules();
+
+        let handles_after = get_chain_rule_handles("prerouting_mangle", &|r| r.contains(test_tun))
+            .expect("Failed to query handles after removal");
+        assert!(handles_after.is_empty(), "Fwmark rule should have been removed");
+    }
+
+    #[test]
     fn test_coexistence_and_cleanup() {
         let _lock = TEST_LOCK.lock().unwrap();
         let test_tun = "tun_test_coex";
@@ -540,9 +688,9 @@ mod tests {
         let tun_peer = Ipv4Addr::new(192, 168, 201, 2);
         let iface = detect_physical_interface();
 
-        let mut client_guard = NftRuleGuard::setup_client(test_tun, iface.as_deref())
+        let mut client_guard = NftRuleGuard::setup_client(test_tun, iface.as_deref(), None)
             .expect("Failed to setup client");
-        let mut server_guard = NftRuleGuard::setup_server(test_port, tun_peer, None, iface.as_deref())
+        let mut server_guard = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, None, iface.as_deref(), None)
             .expect("Failed to setup server");
 
         // Both client and server rules exist
@@ -583,9 +731,9 @@ mod tests {
         let tun_peer = Ipv4Addr::new(192, 168, 201, 2);
         let iface = detect_physical_interface();
 
-        let mut server1 = NftRuleGuard::setup_server(port1, tun_peer, None, iface.as_deref())
+        let mut server1 = NftRuleGuard::setup_server(port1, "tun_test_s1", tun_peer, None, iface.as_deref(), None)
             .expect("Failed to setup server 1");
-        let mut server2 = NftRuleGuard::setup_server(port2, tun_peer, None, iface.as_deref())
+        let mut server2 = NftRuleGuard::setup_server(port2, "tun_test_s2", tun_peer, None, iface.as_deref(), None)
             .expect("Failed to setup server 2");
 
         let port1_str = port1.to_string();
