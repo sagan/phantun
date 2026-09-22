@@ -19,6 +19,7 @@ A lightweight and fast UDP to TCP obfuscator.
         * [Server](#server)
             * [Using nftables](#using-nftables)
             * [Using iptables](#using-iptables)
+        * [Policy routing with fwmark (Optional)](#policy-routing-with-fwmark-optional)
     * [3. Run Phantun binaries as non-root (Optional)](#3-run-phantun-binaries-as-non-root-optional)
     * [4. Start Phantun daemon](#4-start-phantun-daemon)
         * [Server](#server)
@@ -185,6 +186,46 @@ table inet nat {
 ```
 iptables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination 192.168.201.2
 ip6tables -t nat -A PREROUTING -p tcp -i eth0 --dport 4567 -j DNAT --to-destination fcc9::2
+```
+
+[Back to TOC](#table-of-contents)
+
+### Policy routing with fwmark (Optional)
+
+In complex network setups (e.g. multi-WAN, policy routing, VRFs, WireGuard), you can mark the fake TCP packets originating from Phantun Client or Server with a netfilter fwmark using `--fwmark <MARK>` (e.g. `--fwmark 0x100` or `--fwmark 256`).
+
+By default, Phantun automatically configures the corresponding rule in `table inet phantun` (chain `prerouting_mangle`):
+```
+table inet phantun {
+    chain prerouting_mangle {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "tun0" meta mark set 0x100
+    }
+}
+```
+
+You can then control the routing of Phantun's traffic using Linux `ip rule`:
+```bash
+ip rule add fwmark 0x100 lookup 100
+ip route add default via 192.168.1.1 dev eth1 table 100
+```
+
+#### Manual firewall rule for fwmark (if using `--no-nftables`)
+
+##### Using nftables
+```
+table inet mangle {
+    chain prerouting {
+        type filter hook prerouting priority mangle; policy accept;
+        iifname "tun0" meta mark set 0x100
+    }
+}
+```
+
+##### Using iptables
+```bash
+iptables -t mangle -A PREROUTING -i tun0 -j MARK --set-mark 0x100
+ip6tables -t mangle -A PREROUTING -i tun0 -j MARK --set-mark 0x100
 ```
 
 [Back to TOC](#table-of-contents)
