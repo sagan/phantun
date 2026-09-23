@@ -225,3 +225,56 @@ fn test_binary_server_fwmark() {
         assert!(!text_after.contains("tun_t_sfwm"), "Rule for tun_t_sfwm should be removed");
     }
 }
+
+#[test]
+fn test_binary_server_nft_interface_wildcard() {
+    let _lock = TEST_LOCK.lock().unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
+        .args([
+            "--local", "4573",
+            "--remote", "127.0.0.1:1237",
+            "--tun", "tun_t_swild",
+            "-i", "*",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("Failed to start server binary with wildcard interface");
+
+    thread::sleep(Duration::from_millis(800));
+
+    // Verify rules were added to table inet phantun without iif
+    let output = Command::new("nft")
+        .args(["list", "table", "inet", "phantun"])
+        .output()
+        .expect("Failed to run nft list");
+
+    assert!(output.status.success(), "table inet phantun should exist");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("chain prerouting"), "chain prerouting should exist");
+    assert!(text.contains("tcp dport 4573"), "tcp dport 4573 rule should exist");
+
+    // Look at the line with 4573 and verify it does NOT contain iif
+    for line in text.lines() {
+        if line.contains("4573") {
+            assert!(!line.contains("iif"), "Rule with port 4573 must not have iif clause: {}", line);
+        }
+    }
+
+    // Terminate server with SIGTERM
+    send_sigterm(child.id());
+    let status = child.wait().expect("Failed to wait on child");
+    assert!(status.success(), "Server should exit cleanly on SIGTERM");
+
+    // Verify rule removed
+    let output_after = Command::new("nft")
+        .args(["list", "table", "inet", "phantun"])
+        .output()
+        .expect("Failed to run nft list");
+
+    if output_after.status.success() {
+        let text_after = String::from_utf8_lossy(&output_after.stdout);
+        assert!(!text_after.contains("4573"), "Rule for 4573 should be removed");
+    }
+}

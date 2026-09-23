@@ -120,11 +120,14 @@ async fn main() -> io::Result<()> {
         )
         .arg(
             Arg::new("nft_interface")
+                .short('i')
                 .long("nft-interface")
                 .alias("interface")
+                .alias("nft-iface")
+                .alias("iface")
                 .required(false)
                 .value_name("IFACE")
-                .help("Sets the physical network interface used in nftables rules (default: auto-detected)")
+                .help("Sets the physical network interface used in nftables rules (default: auto-detected, use \"*\" to not bind to any interface)")
         )
         .arg(
             Arg::new("fwmark")
