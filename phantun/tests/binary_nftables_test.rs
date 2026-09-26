@@ -235,7 +235,7 @@ fn test_binary_server_nft_interface_wildcard() {
             "--local", "4573",
             "--remote", "127.0.0.1:1237",
             "--tun", "tun_t_swild",
-            "-i", "*",
+            "-i", "-",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

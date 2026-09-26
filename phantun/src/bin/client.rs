@@ -176,7 +176,7 @@ async fn main() -> io::Result<()> {
                 .alias("iface")
                 .required(false)
                 .value_name("IFACE")
-                .help("Sets the physical network interface used in nftables rules (default: auto-detected, use \"*\" to not bind to any interface)")
+                .help("Sets the physical network interface used in nftables rules (default: auto-detected, use \"-\" to not bind to any interface)")
         )
         .arg(
             Arg::new("fwmark")

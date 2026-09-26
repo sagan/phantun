@@ -31,7 +31,7 @@ impl NftRuleGuard {
     /// Chain: `postrouting`
     /// Rule: `iifname "<tun_name>" oif "<iface>" masquerade`
     /// If `physical_iface` is None, auto-detection is attempted. If still None or if
-    /// `physical_iface` is Some("*"), `iifname "<tun_name>" masquerade` is added.
+    /// `physical_iface` is Some("-"), `iifname "<tun_name>" masquerade` is added.
     /// If `fwmark` is Some, a rule is also added to `prerouting_mangle`:
     /// `iifname "<tun_name>" meta mark set <fwmark>`
     pub fn setup_client(
@@ -40,7 +40,7 @@ impl NftRuleGuard {
         fwmark: Option<u32>,
     ) -> io::Result<Self> {
         let detected_iface = match physical_iface {
-            Some("*") | Some("") => None,
+            Some("-") | Some("") => None,
             Some(iface) => Some(iface.to_string()),
             None => detect_physical_interface(),
         };
@@ -192,7 +192,7 @@ impl NftRuleGuard {
     /// IPv4 Rule: `iif "<iface>" tcp dport <local_port> dnat ip to <tun_peer>`
     /// IPv6 Rule: `iif "<iface>" tcp dport <local_port> dnat ip6 to <tun_peer6>` (if IPv6 enabled)
     /// If `physical_iface` is None, auto-detection is attempted. If still None or if
-    /// `physical_iface` is Some("*"), rules are added without the `iif "<iface>"` clause:
+    /// `physical_iface` is Some("-"), rules are added without the `iif "<iface>"` clause:
     /// `tcp dport <local_port> dnat ip to <tun_peer>`
     /// If `fwmark` is Some, a rule is also added to `prerouting_mangle`:
     /// `iifname "<tun_name>" meta mark set <fwmark>`
@@ -205,7 +205,7 @@ impl NftRuleGuard {
         fwmark: Option<u32>,
     ) -> io::Result<Self> {
         let detected_iface = match physical_iface {
-            Some("*") | Some("") => None,
+            Some("-") | Some("") => None,
             Some(iface) => Some(iface.to_string()),
             None => detect_physical_interface(),
         };
@@ -224,11 +224,11 @@ impl NftRuleGuard {
 
         // 3. IPv4 DNAT rule
         let rule4_str = match iface_opt {
+            Some("-") | None => format!("tcp dport {} dnat ip to {}", local_port, tun_peer),
             Some(iface) => format!(
                 "iif \"{}\" tcp dport {} dnat ip to {}",
                 iface, local_port, tun_peer
             ),
-            None => format!("tcp dport {} dnat ip to {}", local_port, tun_peer),
         };
 
         let iface_quoted = iface_opt.map(|i| format!("\"{}\"", i));
@@ -286,11 +286,11 @@ impl NftRuleGuard {
         // 4. IPv6 DNAT rule (if configured)
         if let Some(peer6) = tun_peer6 {
             let rule6_str = match iface_opt {
+                Some("-") | None => format!("tcp dport {} dnat ip6 to {}", local_port, peer6),
                 Some(iface) => format!(
                     "iif \"{}\" tcp dport {} dnat ip6 to {}",
                     iface, local_port, peer6
                 ),
-                None => format!("tcp dport {} dnat ip6 to {}", local_port, peer6),
             };
 
             let peer6_str = peer6.to_string();
@@ -789,8 +789,8 @@ mod tests {
         let tun_peer = Ipv4Addr::new(192, 168, 201, 2);
         let tun_peer6 = Some(Ipv6Addr::new(0xfcc9, 0, 0, 0, 0, 0, 0, 2));
 
-        // 1. Setup server with wildcard "*"
-        let mut guard = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, Some("*"), None)
+        // 1. Setup server with wildcard "-"
+        let mut guard = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, Some("-"), None)
             .expect("Failed to setup server nftables with wildcard");
         assert_eq!(guard.rules.len(), 2, "Expected IPv4 and IPv6 rules");
 
@@ -805,8 +805,8 @@ mod tests {
             .expect("Failed to query handles");
         assert_eq!(handles.len(), 2);
 
-        // 2. Setup server again with "*" (idempotency)
-        let mut guard2 = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, Some("*"), None)
+        // 2. Setup server again with "-" (idempotency)
+        let mut guard2 = NftRuleGuard::setup_server(test_port, test_tun, tun_peer, tun_peer6, Some("-"), None)
             .expect("Failed to setup server nftables second time");
         let handles2 = get_chain_rule_handles("prerouting", &|r| r.contains(&port_str) && !r.contains("iif"))
             .expect("Failed to query handles");
@@ -826,8 +826,8 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         let test_tun = "tun_test_cwild";
 
-        // 1. Setup client with wildcard "*"
-        let mut guard = NftRuleGuard::setup_client(test_tun, Some("*"), None)
+        // 1. Setup client with wildcard "-"
+        let mut guard = NftRuleGuard::setup_client(test_tun, Some("-"), None)
             .expect("Failed to setup client nftables with wildcard");
         assert_eq!(guard.rules.len(), 1, "Expected masquerade rule");
 
@@ -839,8 +839,8 @@ mod tests {
             .expect("Failed to query handles");
         assert_eq!(handles.len(), 1);
 
-        // 2. Setup client again with "*" (idempotency)
-        let mut guard2 = NftRuleGuard::setup_client(test_tun, Some("*"), None)
+        // 2. Setup client again with "-" (idempotency)
+        let mut guard2 = NftRuleGuard::setup_client(test_tun, Some("-"), None)
             .expect("Failed to setup client nftables second time");
         let handles2 = get_chain_rule_handles("postrouting", &|r| r.contains(test_tun) && !r.contains("oif"))
             .expect("Failed to query handles");

@@ -7,31 +7,35 @@ A lightweight and fast UDP to TCP obfuscator.
 
 # Table of Contents
 
-* [Phantun](#phantun)
-* [Latest release](#latest-release)
-* [Overview](#overview)
-* [Usage](#usage)
-    * [1. Enable Kernel IP forwarding](#1-enable-kernel-ip-forwarding)
-    * [2. Add required firewall rules](#2-add-required-firewall-rules)
-        * [Client](#client)
-            * [Using nftables](#using-nftables)
-            * [Using iptables](#using-iptables)
-        * [Server](#server)
-            * [Using nftables](#using-nftables)
-            * [Using iptables](#using-iptables)
-        * [Policy routing with fwmark (Optional)](#policy-routing-with-fwmark-optional)
-    * [3. Run Phantun binaries as non-root (Optional)](#3-run-phantun-binaries-as-non-root-optional)
-    * [4. Start Phantun daemon](#4-start-phantun-daemon)
-        * [Server](#server)
-        * [Client](#client)
-* [MTU overhead](#mtu-overhead)
-    * [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
-* [Version compatibility](#version-compatibility)
-* [Documentations](#documentations)
-* [Performance](#performance)
-* [Future plans](#future-plans)
-* [Compariation to udp2raw](#compariation-to-udp2raw)
-* [License](#license)
+- [Phantun](#phantun)
+- [Table of Contents](#table-of-contents)
+- [Latest release](#latest-release)
+- [Overview](#overview)
+- [Usage](#usage)
+  - [1. Enable Kernel IP forwarding](#1-enable-kernel-ip-forwarding)
+  - [2. Add required firewall rules](#2-add-required-firewall-rules)
+    - [Client](#client)
+      - [Using nftables](#using-nftables)
+      - [Using iptables](#using-iptables)
+    - [Server](#server)
+      - [Using nftables](#using-nftables-1)
+      - [Using iptables](#using-iptables-1)
+    - [Policy routing with fwmark (Optional)](#policy-routing-with-fwmark-optional)
+      - [Manual firewall rule for fwmark (if using `--no-nftables`)](#manual-firewall-rule-for-fwmark-if-using---no-nftables)
+        - [Using nftables](#using-nftables-2)
+        - [Using iptables](#using-iptables-2)
+  - [3. Run Phantun binaries as non-root (Optional)](#3-run-phantun-binaries-as-non-root-optional)
+  - [4. Start Phantun daemon](#4-start-phantun-daemon)
+    - [Server](#server-1)
+    - [Client](#client-1)
+- [MTU overhead](#mtu-overhead)
+  - [MTU calculation for WireGuard](#mtu-calculation-for-wireguard)
+- [Version compatibility](#version-compatibility)
+- [Documentations](#documentations)
+- [Performance](#performance)
+- [Future plans](#future-plans)
+- [Compariation to udp2raw](#compariation-to-udp2raw)
+- [License](#license)
 
 # Latest release
 
@@ -122,7 +126,7 @@ Edit `/etc/sysctl.conf`, add `net.ipv4.ip_forward=1` and run `sudo sysctl -p /et
 
 ## 2. Add required firewall rules
 
-> **Note:** **Automatic nftables management**: By default, `phantun_client` and `phantun_server` automatically add the required nftables rules to `table inet phantun` on startup and remove them on exit (in a best-effort manner). You can manually specify the physical network interface used in these rules with `-i` / `--nft-interface <IFACE>` (e.g. `-i eth0`), or use `*` (e.g. `-i "*"`) to create rules without binding to any specific interface (e.g. omitting the `iif` clause on the server). You can also disable automatic firewall rule management completely using the `--no-nftables` cmdline flag if you prefer configuring firewall rules manually.
+> **Note:** **Automatic nftables management**: By default, `phantun_client` and `phantun_server` automatically add the required nftables rules to `table inet phantun` on startup and remove them on exit (in a best-effort manner). You can manually specify the physical network interface used in these rules with `-i` / `--nft-interface <IFACE>` (e.g. `-i eth0`), or use `-` (e.g. `-i -`) to create rules without binding to any specific interface (e.g. omitting the `iif` clause on the server). You can also disable automatic firewall rule management completely using the `--no-nftables` cmdline flag if you prefer configuring firewall rules manually.
 
 ### Client
 
@@ -377,7 +381,7 @@ Phantun `v0.3.2` and `udp2raw_arm_asm_aes` `20200818.0` was used. These were the
 Test command: `iperf3 -c <IP> -p <PORT> -R -u -l 1400 -b 1000m -t 30 -P 5`
 
 | Mode                                                                            | Send Speed     | Receive Speed  | Overall CPU Usage                                   |
-|---------------------------------------------------------------------------------|----------------|----------------|-----------------------------------------------------|
+| ------------------------------------------------------------------------------- | -------------- | -------------- | --------------------------------------------------- |
 | Direct (1 stream)                                                               | 3.00 Gbits/sec | 2.37 Gbits/sec | 25% (1 core at 100%)                                |
 | Phantun (1 stream)                                                              | 1.30 Gbits/sec | 1.20 Gbits/sec | 60% (1 core at 100%, 3 cores at 50%)                |
 | udp2raw (`cipher-mode=none` `auth-mode=none` `disable-anti-replay`) (1 stream)  | 1.30 Gbits/sec | 715 Mbits/sec  | 40% (1 core at 100%, 1 core at 50%, 2 cores idling) |
@@ -407,18 +411,18 @@ performance overall and less MTU overhead because lack of additional headers ins
 
 Here is a quick overview of comparison between those two to help you choose:
 
-|                                                  |    Phantun    |      udp2raw      |
-|--------------------------------------------------|:-------------:|:-----------------:|
-| UDP over FakeTCP obfuscation                     |       ✅       |         ✅         |
-| UDP over ICMP obfuscation                        |       ❌       |         ✅         |
-| UDP over UDP obfuscation                         |       ❌       |         ✅         |
-| Multi-threaded                                   |       ✅       |         ❌         |
-| Throughput                                       |     Better    |        Good       |
-| Layer 3 mode                                     | TUN interface | Raw sockets + BPF |
-| Tunneling MTU overhead                           |    12 bytes   |      44 bytes     |
-| Seprate TCP connections for each UDP connection  | Client/Server |    Server only    |
-| Anti-replay, encryption                          |       ❌       |         ✅         |
-| IPv6                                             |       ✅       |          ✅        |
+|                                                 |    Phantun    |      udp2raw      |
+| ----------------------------------------------- | :-----------: | :---------------: |
+| UDP over FakeTCP obfuscation                    |       ✅       |         ✅         |
+| UDP over ICMP obfuscation                       |       ❌       |         ✅         |
+| UDP over UDP obfuscation                        |       ❌       |         ✅         |
+| Multi-threaded                                  |       ✅       |         ❌         |
+| Throughput                                      |    Better     |       Good        |
+| Layer 3 mode                                    | TUN interface | Raw sockets + BPF |
+| Tunneling MTU overhead                          |   12 bytes    |     44 bytes      |
+| Seprate TCP connections for each UDP connection | Client/Server |    Server only    |
+| Anti-replay, encryption                         |       ❌       |         ✅         |
+| IPv6                                            |       ✅       |         ✅         |
 
 [Back to TOC](#table-of-contents)
 
