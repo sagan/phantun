@@ -177,8 +177,8 @@ actual TCP port number used by Phantun server
 table inet nat {
     chain prerouting {
         type nat hook prerouting priority dstnat; policy accept;
-        iif eth0 tcp dport 4567 dnat ip to 192.168.201.2
-        iif eth0 tcp dport 4567 dnat ip6 to fcc9::2
+        iifname "eth0" tcp dport 4567 dnat ip to 192.168.201.2
+        iifname "eth0" tcp dport 4567 dnat ip6 to fcc9::2
     }
 }
 ```

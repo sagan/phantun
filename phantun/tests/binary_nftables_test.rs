@@ -258,7 +258,7 @@ fn test_binary_server_nft_interface_wildcard() {
     // Look at the line with 4573 and verify it does NOT contain iif
     for line in text.lines() {
         if line.contains("4573") {
-            assert!(!line.contains("iif"), "Rule with port 4573 must not have iif clause: {}", line);
+            assert!(!line.contains("iifname"), "Rule with port 4573 must not have iifname clause: {}", line);
         }
     }
 

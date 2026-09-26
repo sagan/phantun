@@ -189,10 +189,10 @@ impl NftRuleGuard {
 
     /// Sets up server nftables rules in table `inet phantun`:
     /// Chain: `prerouting`
-    /// IPv4 Rule: `iif "<iface>" tcp dport <local_port> dnat ip to <tun_peer>`
-    /// IPv6 Rule: `iif "<iface>" tcp dport <local_port> dnat ip6 to <tun_peer6>` (if IPv6 enabled)
+    /// IPv4 Rule: `iifname "<iface>" tcp dport <local_port> dnat ip to <tun_peer>`
+    /// IPv6 Rule: `iifname "<iface>" tcp dport <local_port> dnat ip6 to <tun_peer6>` (if IPv6 enabled)
     /// If `physical_iface` is None, auto-detection is attempted. If still None or if
-    /// `physical_iface` is Some("-"), rules are added without the `iif "<iface>"` clause:
+    /// `physical_iface` is Some("-"), rules are added without the `iifname "<iface>"` clause:
     /// `tcp dport <local_port> dnat ip to <tun_peer>`
     /// If `fwmark` is Some, a rule is also added to `prerouting_mangle`:
     /// `iifname "<tun_name>" meta mark set <fwmark>`
@@ -226,7 +226,7 @@ impl NftRuleGuard {
         let rule4_str = match iface_opt {
             Some("-") | None => format!("tcp dport {} dnat ip to {}", local_port, tun_peer),
             Some(iface) => format!(
-                "iif \"{}\" tcp dport {} dnat ip to {}",
+                "iifname \"{}\" tcp dport {} dnat ip to {}",
                 iface, local_port, tun_peer
             ),
         };
@@ -288,7 +288,7 @@ impl NftRuleGuard {
             let rule6_str = match iface_opt {
                 Some("-") | None => format!("tcp dport {} dnat ip6 to {}", local_port, peer6),
                 Some(iface) => format!(
-                    "iif \"{}\" tcp dport {} dnat ip6 to {}",
+                    "iifname \"{}\" tcp dport {} dnat ip6 to {}",
                     iface, local_port, peer6
                 ),
             };
