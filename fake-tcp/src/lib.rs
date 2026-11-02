@@ -86,6 +86,7 @@ struct Shared {
     tun: Vec<Arc<Tun>>,
     ready: mpsc::Sender<Socket>,
     tuples_purge: broadcast::Sender<AddrTuple>,
+    legacy_seq: bool,
 }
 
 pub struct Stack {
@@ -131,6 +132,11 @@ impl Socket {
         state: State,
     ) -> (Socket, flume::Sender<Bytes>) {
         let (incoming_tx, incoming_rx) = flume::bounded(MPMC_BUFFER_LEN);
+        let initial_seq = if shared.legacy_seq {
+            0
+        } else {
+            rand::random::<u32>()
+        };
 
         (
             Socket {
@@ -139,7 +145,7 @@ impl Socket {
                 incoming: incoming_rx,
                 local_addr,
                 remote_addr,
-                seq: AtomicU32::new(0),
+                seq: AtomicU32::new(initial_seq),
                 ack: AtomicU32::new(ack.unwrap_or(0)),
                 last_ack: AtomicU32::new(ack.unwrap_or(0)),
                 state,
@@ -283,7 +289,7 @@ impl Socket {
 
                         if tcp_packet.get_flags() == tcp::TcpFlags::ACK
                             && tcp_packet.get_acknowledgement()
-                                == self.seq.load(Ordering::Relaxed) + 1
+                                == self.seq.load(Ordering::Relaxed).wrapping_add(1)
                         {
                             // found our ACK
                             self.seq.fetch_add(1, Ordering::Relaxed);
@@ -327,12 +333,12 @@ impl Socket {
 
                             if tcp_packet.get_flags() == tcp::TcpFlags::SYN | tcp::TcpFlags::ACK
                                 && tcp_packet.get_acknowledgement()
-                                    == self.seq.load(Ordering::Relaxed) + 1
+                                    == self.seq.load(Ordering::Relaxed).wrapping_add(1)
                             {
                                 // found our SYN + ACK
                                 self.seq.fetch_add(1, Ordering::Relaxed);
                                 self.ack
-                                    .store(tcp_packet.get_sequence() + 1, Ordering::Relaxed);
+                                    .store(tcp_packet.get_sequence().wrapping_add(1), Ordering::Relaxed);
 
                                 // send ACK to finish handshake
                                 let buf = self.build_tcp_packet(tcp::TcpFlags::ACK, None);
@@ -365,7 +371,7 @@ impl Drop for Socket {
         // dissociates ourself from the dispatch map
         assert!(self.shared.tuples.write().unwrap().remove(&tuple).is_some());
         // purge cache
-        self.shared.tuples_purge.send(tuple).unwrap();
+        let _ = self.shared.tuples_purge.send(tuple);
 
         let buf = build_tcp_packet(
             self.local_addr,
@@ -401,6 +407,16 @@ impl Stack {
     /// of reader will be spawned later. This allows user to utilize the performance
     /// benefit of Multiqueue Tun support on machines with SMP.
     pub fn new(tun: Vec<Tun>, local_ip: Ipv4Addr, local_ip6: Option<Ipv6Addr>) -> Stack {
+        Self::new_with_options(tun, local_ip, local_ip6, false)
+    }
+
+    /// Create a new stack, allowing specification of whether to use legacy 0-sequence numbers.
+    pub fn new_with_options(
+        tun: Vec<Tun>,
+        local_ip: Ipv4Addr,
+        local_ip6: Option<Ipv6Addr>,
+        legacy_seq: bool,
+    ) -> Stack {
         let tun: Vec<Arc<Tun>> = tun.into_iter().map(Arc::new).collect();
         let (ready_tx, ready_rx) = mpsc::channel(MPSC_BUFFER_LEN);
         let (tuples_purge_tx, _tuples_purge_rx) = broadcast::channel(16);
@@ -410,6 +426,7 @@ impl Stack {
             listening: RwLock::new(HashSet::new()),
             ready: ready_tx,
             tuples_purge: tuples_purge_tx.clone(),
+            legacy_seq,
         });
 
         for t in tun {
@@ -542,13 +559,19 @@ impl Stack {
                                     .contains(&tcp_packet.get_destination())
                             {
                                 // SYN seen on listening socket
-                                if tcp_packet.get_sequence() == 0 {
+                                let valid_syn = if shared.legacy_seq {
+                                    tcp_packet.get_sequence() == 0
+                                } else {
+                                    true
+                                };
+
+                                if valid_syn {
                                     let (sock, incoming) = Socket::new(
                                         shared.clone(),
                                         tun.clone(),
                                         local_addr,
                                         remote_addr,
-                                        Some(tcp_packet.get_sequence() + 1),
+                                        Some(tcp_packet.get_sequence().wrapping_add(1)),
                                         State::Idle,
                                     );
                                     assert!(shared
@@ -564,7 +587,10 @@ impl Stack {
                                         local_addr,
                                         remote_addr,
                                         0,
-                                        tcp_packet.get_sequence() + tcp_packet.payload().len() as u32 + 1, // +1 because of SYN flag set
+                                        tcp_packet
+                                            .get_sequence()
+                                            .wrapping_add(tcp_packet.payload().len() as u32)
+                                            .wrapping_add(1), // +1 because of SYN flag set
                                         tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                         None,
                                     );
@@ -576,7 +602,9 @@ impl Stack {
                                     local_addr,
                                     remote_addr,
                                     tcp_packet.get_acknowledgement(),
-                                    tcp_packet.get_sequence() + tcp_packet.payload().len() as u32,
+                                    tcp_packet
+                                        .get_sequence()
+                                        .wrapping_add(tcp_packet.payload().len() as u32),
                                     tcp::TcpFlags::RST | tcp::TcpFlags::ACK,
                                     None,
                                 );
@@ -597,3 +625,88 @@ impl Stack {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_socket_seq_legacy_and_random() {
+        let (ready_tx, _) = mpsc::channel(1);
+        let (purge_tx, _) = broadcast::channel(16);
+
+        let tun = match tokio_tun::TunBuilder::new().build() {
+            Ok(mut t) => Arc::new(t.remove(0)),
+            Err(e) => {
+                eprintln!("Skipping Tun test because Tun cannot be created: {}", e);
+                return;
+            }
+        };
+
+        let shared_legacy = Arc::new(Shared {
+            tuples: RwLock::new(HashMap::new()),
+            listening: RwLock::new(HashSet::new()),
+            tun: vec![tun.clone()],
+            ready: ready_tx.clone(),
+            tuples_purge: purge_tx.clone(),
+            legacy_seq: true,
+        });
+
+        let shared_random = Arc::new(Shared {
+            tuples: RwLock::new(HashMap::new()),
+            listening: RwLock::new(HashSet::new()),
+            tun: vec![tun.clone()],
+            ready: ready_tx,
+            tuples_purge: purge_tx,
+            legacy_seq: false,
+        });
+
+        let local_addr = "127.0.0.1:12345".parse().unwrap();
+        let remote_addr = "127.0.0.1:23456".parse().unwrap();
+        let tuple = AddrTuple::new(local_addr, remote_addr);
+
+        // Test legacy mode: initial seq is always 0
+        for _ in 0..10 {
+            let (sock, incoming) = Socket::new(
+                shared_legacy.clone(),
+                tun.clone(),
+                local_addr,
+                remote_addr,
+                None,
+                State::Idle,
+            );
+            assert_eq!(sock.seq.load(Ordering::Relaxed), 0);
+            shared_legacy
+                .tuples
+                .write()
+                .unwrap()
+                .insert(tuple.clone(), incoming);
+            drop(sock);
+        }
+
+        // Test random mode: initial seq is random
+        let mut sequences = HashSet::new();
+        for i in 0..10 {
+            let local_addr_i = format!("127.0.0.1:{}", 12345 + i).parse().unwrap();
+            let tuple_i = AddrTuple::new(local_addr_i, remote_addr);
+            let (sock, incoming) = Socket::new(
+                shared_random.clone(),
+                tun.clone(),
+                local_addr_i,
+                remote_addr,
+                None,
+                State::Idle,
+            );
+            let seq = sock.seq.load(Ordering::Relaxed);
+            sequences.insert(seq);
+            shared_random
+                .tuples
+                .write()
+                .unwrap()
+                .insert(tuple_i, incoming);
+            drop(sock);
+        }
+        assert!(sequences.len() >= 9);
+    }
+}
+

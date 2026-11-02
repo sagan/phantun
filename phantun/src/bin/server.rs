@@ -138,6 +138,15 @@ async fn main() -> io::Result<()> {
                 .value_parser(phantun::nftables::parse_fwmark)
                 .help("Sets the netfilter fwmark for fake TCP packets originating from the Tun interface (accepts decimal or 0x-prefixed hex)")
         )
+        .arg(
+            Arg::new("legacy_seq")
+                .long("legacy-seq")
+                .alias("legacy-0seq")
+                .alias("legacy-zero-seq")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                .help("Revert to legacy behavior where TCP sequence numbers start at 0 (zero) and incoming client SYN must have seq 0")
+        )
         .get_matches();
 
     let local_port: u16 = matches
@@ -145,6 +154,11 @@ async fn main() -> io::Result<()> {
         .unwrap()
         .parse()
         .expect("bad local port");
+
+    let legacy_seq = matches.get_flag("legacy_seq");
+    if legacy_seq {
+        info!("Legacy 0-sequence number mode enabled");
+    }
 
     let remote_addr = tokio::net::lookup_host(matches.get_one::<String>("remote").unwrap())
         .await
@@ -229,7 +243,7 @@ async fn main() -> io::Result<()> {
     };
 
     //thread::sleep(time::Duration::from_secs(5));
-    let mut stack = Stack::new(tun, tun_local, tun_local6);
+    let mut stack = Stack::new_with_options(tun, tun_local, tun_local6, legacy_seq);
     stack.listen(local_port);
     info!("Listening on {}", local_port);
 

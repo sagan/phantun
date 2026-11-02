@@ -187,6 +187,15 @@ async fn main() -> io::Result<()> {
                 .value_parser(phantun::nftables::parse_fwmark)
                 .help("Sets the netfilter fwmark for fake TCP packets originating from the Tun interface (accepts decimal or 0x-prefixed hex)")
         )
+        .arg(
+            Arg::new("legacy_seq")
+                .long("legacy-seq")
+                .alias("legacy-0seq")
+                .alias("legacy-zero-seq")
+                .required(false)
+                .action(ArgAction::SetTrue)
+                .help("Revert to legacy behavior where TCP sequence numbers start at 0 (zero) instead of a random number")
+        )
         .get_matches();
 
     let local_addr: SocketAddr = matches
@@ -194,6 +203,11 @@ async fn main() -> io::Result<()> {
         .unwrap()
         .parse()
         .expect("bad local address");
+
+    let legacy_seq = matches.get_flag("legacy_seq");
+    if legacy_seq {
+        info!("Legacy 0-sequence number mode enabled");
+    }
 
     let ipv4_only = matches.get_flag("ipv4_only");
 
@@ -295,7 +309,7 @@ async fn main() -> io::Result<()> {
     let shared_remote_addr = Arc::new(RwLock::new(remote_addr));
     let connection_broken = Arc::new(AtomicBool::new(false));
 
-    let mut stack = Stack::new(tun, tun_peer, tun_peer6);
+    let mut stack = Stack::new_with_options(tun, tun_peer, tun_peer6, legacy_seq);
 
     let mut main_loop: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
         let mut buf_r = [0u8; MAX_PACKET_LEN];

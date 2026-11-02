@@ -278,3 +278,51 @@ fn test_binary_server_nft_interface_wildcard() {
         assert!(!text_after.contains("4573"), "Rule for 4573 should be removed");
     }
 }
+
+#[test]
+fn test_binary_legacy_seq_flag() {
+    let _lock = TEST_LOCK.lock().unwrap();
+
+    // Verify client accepts --legacy-seq and aliases
+    for flag in ["--legacy-seq", "--legacy-0seq", "--legacy-zero-seq"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_client"))
+            .args([
+                "--local", "127.0.0.1:14568",
+                "--remote", "127.0.0.1:14569",
+                "--tun", "tun_t_cleg",
+                "--no-nftables",
+                flag,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|_| panic!("Failed to start client with {}", flag));
+
+        thread::sleep(Duration::from_millis(500));
+        send_sigterm(child.id());
+        let status = child.wait().expect("Failed to wait on child");
+        assert!(status.success(), "Client with {} should exit cleanly", flag);
+    }
+
+    // Verify server accepts --legacy-seq and aliases
+    for flag in ["--legacy-seq", "--legacy-0seq", "--legacy-zero-seq"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_server"))
+            .args([
+                "--local", "14570",
+                "--remote", "127.0.0.1:14571",
+                "--tun", "tun_t_sleg",
+                "--no-nftables",
+                flag,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap_or_else(|_| panic!("Failed to start server with {}", flag));
+
+        thread::sleep(Duration::from_millis(500));
+        send_sigterm(child.id());
+        let status = child.wait().expect("Failed to wait on child");
+        assert!(status.success(), "Server with {} should exit cleanly", flag);
+    }
+}
+
