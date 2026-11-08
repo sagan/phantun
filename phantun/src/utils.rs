@@ -1,3 +1,10 @@
+use base64::{
+    alphabet,
+    engine::{
+        DecodePaddingMode, Engine as _, GeneralPurposeConfig,
+        general_purpose::GeneralPurpose,
+    },
+};
 use neli::{
     consts::{
         nl::NlmF,
@@ -17,6 +24,24 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use std::os::unix::io::AsRawFd;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
+
+// Lenient engines: accept either alphabet, padding optional (but canonical when present)
+const LENIENT_STANDARD: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+const LENIENT_URL_SAFE: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::URL_SAFE,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
+
+/// Decode base64 data in any common variant: standard or URL-safe alphabet,
+/// with or without padding.
+pub fn decode_base64_lenient(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    LENIENT_STANDARD
+        .decode(data)
+        .or_else(|_| LENIENT_URL_SAFE.decode(data))
+}
 
 pub fn new_udp_reuseport(local_addr: SocketAddr) -> UdpSocket {
     let udp_sock = socket2::Socket::new(
@@ -152,4 +177,30 @@ pub fn assign_ipv6_address(device_name: &str, local: Ipv6Addr, peer: Ipv6Addr) {
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_base64_lenient() {
+        // standard alphabet, with/without padding
+        assert_eq!(
+            decode_base64_lenient("aGVsbG8gd29ybGQ=").unwrap(),
+            b"hello world"
+        );
+        assert_eq!(
+            decode_base64_lenient("aGVsbG8gd29ybGQ").unwrap(),
+            b"hello world"
+        );
+
+        // URL-safe alphabet (`-` and `_`), with/without padding
+        assert_eq!(decode_base64_lenient("-___").unwrap(), [0xfb, 0xff, 0xff]);
+        assert_eq!(decode_base64_lenient("+w==").unwrap(), [0xfb]);
+        assert_eq!(decode_base64_lenient("-w==").unwrap(), [0xfb]);
+
+        // invalid input is rejected
+        assert!(decode_base64_lenient("!!!invalid").is_err());
+    }
 }

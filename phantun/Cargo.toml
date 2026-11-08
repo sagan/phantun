@@ -11,6 +11,7 @@ Transforms UDP stream into (fake) TCP streams that can go through
 Layer 3 & Layer 4 (NAPT) firewalls/NATs.
 """
 [dependencies]
+base64 = "0"
 clap = { version = "4", features = ["cargo"] }
 socket2 = { version = "0", features = ["all"] }
 fake-tcp = { path = "../fake-tcp", version = "0" }

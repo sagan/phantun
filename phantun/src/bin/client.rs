@@ -3,7 +3,9 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::{Socket, Stack};
 use log::{debug, error, info, trace, warn};
 use phantun::nftables::NftRuleGuard;
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport, udp_recv_pktinfo};
+use phantun::utils::{
+    assign_ipv6_address, decode_base64_lenient, new_udp_reuseport, udp_recv_pktinfo,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -112,6 +114,19 @@ async fn main() -> io::Result<()> {
                 .help("Specify a file, which, after TCP handshake, its content will be sent as the \
                       first data packet to the server.\n\
                       Note: ensure this file's size does not exceed the MTU of the outgoing interface. \
+                      The content is always sent out in a single packet and will not be further segmented")
+        )
+        .arg(
+            Arg::new("handshake_packet_data")
+                .long("handshake-packet-data")
+                .required(false)
+                .value_name("BASE64")
+                .conflicts_with("handshake_packet")
+                .allow_hyphen_values(true)
+                .help("Specify base64 encoded data (standard or URL-safe alphabet, with or \
+                      without padding), which, after TCP handshake, will be sent as the \
+                      first data packet to the server.\n\
+                      Note: ensure this data's size does not exceed the MTU of the outgoing interface. \
                       The content is always sent out in a single packet and will not be further segmented")
         )
         .arg(
@@ -252,10 +267,15 @@ async fn main() -> io::Result<()> {
     };
 
     let tun_name = matches.get_one::<String>("tun").unwrap();
-    let handshake_packet: Option<Vec<u8>> = matches
-        .get_one::<String>("handshake_packet")
-        .map(fs::read)
-        .transpose()?;
+    let handshake_packet: Option<Vec<u8>> = if let Some(path) =
+        matches.get_one::<String>("handshake_packet")
+    {
+        Some(fs::read(path)?)
+    } else if let Some(data) = matches.get_one::<String>("handshake_packet_data") {
+        Some(decode_base64_lenient(data).expect("failed to decode base64 handshake packet data"))
+    } else {
+        None
+    };
 
     let active_timeout = Duration::from_secs(*matches.get_one::<u64>("active_timeout").unwrap());
     let tcp_keepalive_time = matches

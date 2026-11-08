@@ -3,7 +3,7 @@ use fake_tcp::packet::MAX_PACKET_LEN;
 use fake_tcp::Stack;
 use log::{debug, error, info};
 use phantun::nftables::NftRuleGuard;
-use phantun::utils::{assign_ipv6_address, new_udp_reuseport};
+use phantun::utils::{assign_ipv6_address, decode_base64_lenient, new_udp_reuseport};
 use std::fs;
 use std::io;
 use std::net::Ipv4Addr;
@@ -103,6 +103,19 @@ async fn main() -> io::Result<()> {
                       The content is always sent out in a single packet and will not be further segmented")
         )
         .arg(
+            Arg::new("handshake_packet_data")
+                .long("handshake-packet-data")
+                .required(false)
+                .value_name("BASE64")
+                .conflicts_with("handshake_packet")
+                .allow_hyphen_values(true)
+                .help("Specify base64 encoded data (standard or URL-safe alphabet, with or \
+                      without padding), which, after TCP handshake, will be sent as the \
+                      first data packet to the client.\n\
+                      Note: ensure this data's size does not exceed the MTU of the outgoing interface. \
+                      The content is always sent out in a single packet and will not be further segmented")
+        )
+        .arg(
             Arg::new("filter_handshake")
                 .long("filter-handshake")
                 .required(false)
@@ -193,10 +206,15 @@ async fn main() -> io::Result<()> {
     };
 
     let tun_name = matches.get_one::<String>("tun").unwrap();
-    let handshake_packet: Option<Vec<u8>> = matches
-        .get_one::<String>("handshake_packet")
-        .map(fs::read)
-        .transpose()?;
+    let handshake_packet: Option<Vec<u8>> = if let Some(path) =
+        matches.get_one::<String>("handshake_packet")
+    {
+        Some(fs::read(path)?)
+    } else if let Some(data) = matches.get_one::<String>("handshake_packet_data") {
+        Some(decode_base64_lenient(data).expect("failed to decode base64 handshake packet data"))
+    } else {
+        None
+    };
     let filter_handshake = matches.get_flag("filter_handshake") || handshake_packet.is_some();
     let handshake_packet_bytes = handshake_packet.clone();
 
